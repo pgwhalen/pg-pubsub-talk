@@ -1,0 +1,736 @@
+---
+title: "Who Needs Kafka? Simple PubSub on Postgres Using LISTEN/NOTIFY"
+author: "Paul Whalen"
+output-dir: "presentation"
+output: asis
+format:
+    revealjs:
+        theme: [night, custom_style.scss]
+        embed-resources: true
+        code-line-numbers: false
+        slide-number: c/t
+        scrollable: true
+---
+
+```{python}
+
+import psycopg2
+
+conn = psycopg2.connect(
+    dbname="paul",
+    user="paul",
+    host="localhost",
+    port=5432
+)
+cursor = conn.cursor()
+cursor.execute("DROP SCHEMA pubsub CASCADE")
+cursor.execute("CREATE SCHEMA pubsub")
+conn.commit()
+
+def run_sql(sql: str, print_sql: bool, print_output: bool, client = 'pub'):
+    conn = psycopg2.connect(
+        dbname="paul",
+        user="paul",
+        host="localhost",
+        port=5432
+    )
+    
+    css_class = " "
+    if client == "pub":
+        css_class = " .pubsql" 
+    elif client == "sub":
+        css_class = " .subsql" 
+    else:
+        css_class = " "
+    sql = sql.rstrip()
+    if print_sql:
+        print("```{.sql" + css_class + "}" + sql + "\n```\n")
+    cursor = conn.cursor()
+    cursor.execute("SET schema 'pubsub'")
+    cursor.execute(sql)
+    if print_output:
+        fetch_and_print_md_table(cursor)
+    conn.commit()
+    conn.close()
+
+def fetch_and_print_md_table(cursor):
+    rows = cursor.fetchall()
+    column_names = [desc[0] for desc in cursor.description]
+
+    header = "| " + " | ".join(column_names) + " |"
+    separator = "| " + " | ".join("---" for _ in column_names) + " |"
+
+    table_rows = ["| " + " | ".join(map(str, row)) + " |" for row in rows]
+
+    table = "\n".join([header, separator] + table_rows)
+    print(table)
+```
+
+## whoami
+ - Senior Staff Software Engineer @ PEAK6 Capital Management
+	- Proprietary options trading firm in Chicago
+ - ~10 YOE as primarily-backend application engineer (Java, Go, Python)
+	- Data engineering experience as well, with lots of Kafka and SQL
+ - Database nerd
+
+## Agenda
+- PubSub in Theory
+	- On Kafka
+	- On Postgres, with LISTEN/NOTIFY
+- LISTEN/NOTIFY in Practice
+	- Config blob service
+	- Shopping cart
+	- Time series server
+	- Ticker viewer
+- Summary of patterns and gotchas
+
+::: {.notes}
+ - the goal of the presentation is unifying concepts and discussing the *detailed* tradeoffs
+	- business use cases are somewhere in between
+ - how messaging and persistence are closely related
+	- data in motion vs data at rest is a fine line
+ - use cases beyond just "generic job server"
+ - less theory, more practice
+	- not about the generic stuff, but about the application design stuff
+ - lessons from our prod stuff (for each section, compare to kafka)
+	- config daemon
+		- you can't exceed the 8k limit
+	- idea manager
+		- you can be clever about indicating who should reload
+		- can load a bunch of state, rather than just what was sent.
+	- datashed
+		- you can decouple the notifies from the reads, reading less frequently
+		- do a lot of work (BUT DO IT ELSEWHERE)
+	- consume
+		- you can ensure you don't miss messages with sequence nums + time
+ 
+:::
+
+# PubSub in Theory
+
+## What is PubSub? {.smaller}
+
+:::{.incremental}
+- A messaging pattern
+- Publishers send messages for a topic
+- Subscribers receive messages on a topic
+- Subscribers don't know about publishers, publishers don't know about subscribers
+	- Something in the middle (a "broker") connects the two
+- Optionally:
+	- Usually real time
+	- Persistent or ephemeral
+	- "Queue" behavior, marking messages as processed
+:::
+
+## What is PubSub?
+
+:::{.r-stretch fig-align="center"}
+![](pubsub.excalidraw.svg)
+:::
+
+## Kafka as an implementation of PubSub {.smaller}
+ - Producers publish messages on a topic to broker
+ 	- Messages are written in order, and assigned IDs ("offset")
+ - Consumers subscribe to a topic and recieve messages from broker
+	- Read from an offset
+
+:::{.r-stretch}
+![](kafka.excalidraw.svg)
+:::
+
+## Kafka key points
+
+::: {.incremental}
+ - Messages are persisted
+ - Consumer can read older messages
+ - Consumers process every message
+ - Consumers read the entire message
+:::
+
+## Postgres LISTEN/NOTIFY
+
+ - `NOTIFY` is the "publish" command (writer)
+ - `LISTEN` is the "subscribe" command (reader)
+ - `NOTIFY` sends a message on a channel
+ - Any connection currently `LISTEN`ing on that channel receives the message
+
+:::: {.columns .fragment}
+::: {.column width="65%"}
+Publisher:
+```{.sql background-color="green"}
+SELECT pg_notify('a_channel', 'hello world');
+```
+:::
+
+::: {.column width="35%"}
+Subscriber:
+```{.sql .pubsql}
+LISTEN a_channel;
+```
+:::
+::::
+
+::: {.notes}
+ - calling the function
+:::
+
+## "Kafka" on Postgres
+ - A table per topic
+ - Publisher writes to table, `NOTIFY` ID
+ - Susbcriber `LISTEN`S, reads messages from table
+
+::: {.notes}
+ - this is the simplest possible implementation
+:::
+
+## "Kafka" on Postgres
+
+Table to store messages
+```{python}
+run_sql("""
+CREATE TABLE a_topic (
+	id SERIAL PRIMARY KEY,
+	message TEXT
+)
+""", print_sql=True, print_output=False)
+```
+
+Subscriber listens
+```{.sql .myframe}
+LISTEN a_topic;
+```
+
+Publisher writes message...
+```{python}
+run_sql("""
+INSERT INTO a_topic (message)
+VALUES ('hi')
+RETURNING id
+""", print_sql=True, print_output=False)
+```
+... and notifies that it has been written (transactionally)
+```{python}
+run_sql("""
+SELECT pg_notify('a_topic', '1')
+""", print_sql=True, print_output=False)
+```
+
+## "Kafka" on Postgres
+
+Subscriber receives notification...
+```{.log}
+'1'
+```
+... and reads message
+```{python}
+run_sql("""
+SELECT * FROM a_topic WHERE id = 1
+""", print_sql=True, print_output=True)
+```
+
+
+::: {.notes}
+ - notice we're not sending the whole message: it's a bad idea, more on that later
+:::
+
+# LISTEN/NOTIFY in Production
+
+# Config Blob Service
+
+## Config Blob Service
+
+ - A service that provides create/read/update/delete storage for a blob
+ - Updates are pushed out immediately to the front end
+ - The configuration is opaque to the DB, understood only by the
+ application
+
+::: {.fragment}
+```{python}
+run_sql("""
+CREATE TABLE profile_config
+(
+    profile_id  SERIAL PRIMARY KEY,
+    modified_at TIMESTAMPTZ DEFAULT now(),
+    config      JSON
+)
+""", print_sql=True, print_output=False)
+```
+:::
+
+## Writing Data
+
+Example config blob
+```{python}
+run_sql("""
+SELECT json_build_object(
+    'profile_id', 1,
+	'config_key', 'config_val'
+) AS data
+""", print_sql=True, print_output=True)
+```
+
+## Writing Data
+
+Insert blob
+```{python}
+run_sql("""
+INSERT INTO profile_config (modified_at, config)
+VALUES (
+	now(),
+	json_build_object(
+    	'profile_id', 1,
+		'config_key', 'config_val'
+	)
+)
+""", print_sql=True, print_output=False)
+```
+
+Notify `config_update` channel with contents of blob
+```{python}
+run_sql("""
+SELECT pg_notify(
+	'config_update',
+	json_build_object(
+		'profile_id', 1,
+		'config_key', 'config_val'
+	)::text
+)
+""", print_sql=True, print_output=False)
+```
+
+## Reading Data
+
+Subscriber `LISTEN`s (before data was written)
+```{.sql}
+LISTEN config_update;
+```
+
+Receives
+```{.log}
+{‘profile_id’: 1, ‘config_key’: ‘config_val’}
+```
+
+::: {.fragment}
+... **there's no `SELECT`!**
+:::
+
+::: {.fragment}
+Cool!
+
+ - Faster
+ - Less indirection
+ - Like Kafka: only receive, not the notify *then* read
+:::
+
+## Large write
+
+But what if the newly written config blob is big?
+
+::: {.fragment}
+```{python}
+#| error: true
+run_sql("""
+SELECT pg_notify(
+	'config_update',
+	json_build_object(
+		'profile_id', 1,
+		'config_key', REPEAT('a', 10000)
+	)::text
+)
+""", print_sql=True, print_output=False)
+```
+:::
+
+## Large write problems
+
+ - **❗ Gotcha ❗**: `NOTIFY` payloads have a **hard 8kb limit**
+ - You must know the data you're putting in the payload
+	- Don't accept untrusted data
+	- In our case, it wasn't malicious, and it was only just barely over
+
+:::{.notes}
+ - the only way to get around the limit is to recompile postgres!
+ - growth
+:::
+
+## Large writes
+
+::: {.incremental}
+ - Kafka has a message limit size too, but it is much larger (1MB)
+	- (with config, you can get it up over 100MB)
+ - I have also been the idiot writing large messages in Kafka
+ - In Postgres, you can decouple the notification from the read/write
+ - **🟢 Pattern 🟢**: `NOTIFY` *instructions* about what to read, not the data itself
+	- Many times, this is the ID of a row
+:::
+
+# Shopping Cart
+
+::: {.notes}
+ - not something we've built, but easier without explaining trading
+:::
+
+## Shopping
+
+ - A service that manages an online shopping cart (e.g. Amazon)
+ - When an item is added to the cart, a row is added to the table
+ - A front end is connecting to one instance of the server and is `LISTEN`ing to postgres
+ 	- There are multiple instances of the service
+
+::: {.fragment}
+```{python}
+run_sql("""
+CREATE TABLE shopping_cart
+(
+    id       SERIAL PRIMARY KEY,
+    item     TEXT NOT NULL,
+    username TEXT NOT NULL
+)
+""", print_sql=True, print_output=False)
+```
+:::
+
+## Adding an item to the cart
+
+::: {.fragment}
+Add item
+```{python}
+run_sql("""
+INSERT INTO shopping_cart (item, username)
+VALUES ('iPhone', 'paul')
+""", print_sql=True, print_output=False)
+```
+:::
+
+::: {.fragment}
+Rather than `NOTIFY`ing the ID, we `NOTIFY` for the *user*:
+```{python}
+run_sql("""
+SELECT pg_notify('shopping_cart', 'paul')
+""", print_sql=True, print_output=False)
+```
+
+**🟢 Pattern 🟢**: `NOTIFY` *instructions* about what to read, not the data itself
+:::
+
+::: {.fragment}
+Listening
+```{.sql}
+LISTEN a_channel;  -- 'paul'
+```
+:::
+
+::: {.fragment}
+Read the *entire* cart for the user
+```{python}
+run_sql("""
+SELECT *
+FROM shopping_cart
+WHERE username = 'paul'
+""", print_sql=True, print_output=True)
+```
+:::
+
+## Querying for the whole cart
+
+::: {.incremental}
+ - Querying for the entire shopping cart is easiest
+	- Service doesn't need to track to cart, it just refreshes it
+	- The whole cart is never prohibitively large
+ - With Kafka, you get all the messages
+	- Must track the state of the cart in the service
+ - **🟢 Pattern 🟢**: On `LISTEN`, query for the whole state
+	- Let the database manage the state
+ - Stateful stream processing with Kafka:
+	- The greatest mistake of my career
+:::
+
+## Not querying at all
+
+::: {.incremental}
+ - A given user front end is only connected to one instance
+ - We only need to read the cart if the user is connected to that instance
+ - With Kafka, you have to receive the contents of all messages
+	- Exception: *partitions*
+	- Partitions can be clumsly; you can only partition one way
+:::
+
+## Bonus: Handling deletes {.smaller}
+
+::: {.fragment}
+Add a column representing items that were removed from the cart
+```{python}
+run_sql("""
+ALTER TABLE shopping_cart
+    ADD COLUMN removed BOOLEAN DEFAULT FALSE
+""", print_sql=True, print_output=False)
+```
+:::
+
+::: {.fragment}
+User removes from cart
+```{python}
+run_sql("""
+UPDATE shopping_cart
+SET removed = true
+WHERE ID = 1
+""", print_sql=True, print_output=False)
+```
+
+```{python}
+run_sql("""
+SELECT pg_notify('shopping_cart', 'paul')
+""", print_sql=True, print_output=False)
+```
+:::
+
+::: {.fragment}
+```{python}
+run_sql("""
+SELECT *
+FROM shopping_cart
+WHERE username = 'paul'
+AND NOT removed
+""", print_sql=True, print_output=False)
+```
+
+... there's nothing in the cart!
+:::
+
+::: {.fragment}
+**🟢 Pattern 🟢**: Query for the whole state, let the database manage the state
+:::
+
+## Deletes in Kafka
+
+- "Tombstone" messages indicating delete
+- Application must update state to handle delete
+	- Often surprisingly hard, especially when it involves
+	outputting more tombstone messages
+
+# Time Series Server
+
+## Time Series Server
+
+ - Time series storage of stock prices throughout the day
+ - Traders want to see up-to-date aggregations, like min/max/avg
+
+::: {.fragment}
+```{python}
+run_sql("""
+CREATE TABLE stock_price
+(
+    ticker    TEXT,
+    timestamp TIMESTAMPTZ,
+    price     NUMERIC
+)
+""", print_sql=True, print_output=False)
+```
+:::
+
+## A write-heavy workload
+
+Stock price changes *a lot*
+
+::: {.fragment}
+```{python}
+run_sql("""
+INSERT INTO stock_price (ticker, timestamp, price)
+VALUES ('AAPL', '2025-01-01 8:30:00', 100.00),
+       ('AAPL', '2025-01-01 8:30:01', 100.01),
+       ('AAPL', '2025-01-01 8:30:02', 100.02)
+""", print_sql=True, print_output=False)
+```
+
+```{python}
+run_sql("""
+SELECT pg_notify('stock_price', 'AAPL');
+SELECT pg_notify('stock_price', 'AAPL');
+SELECT pg_notify('stock_price', 'AAPL')
+""", print_sql=True, print_output=False)
+```
+
+```{.sql}
+LISTEN stock_price;
+```
+```{.log}
+'AAPL'
+'AAPL'
+'AAPL'
+```
+:::
+
+## Serving up-to-date aggregations {.smaller}
+
+On `LISTEN`, we do this aggregation query 3 times
+
+::: {.fragment}
+```{python}
+run_sql("""
+SELECT ticker, avg(price) FROM stock_price
+GROUP BY ticker
+""", print_sql=True, print_output=True)
+```
+:::
+
+::: {.incremental}
+ - This query could be intensive with a lot of data
+ - Queries could get backed up behind each other on thread the service is using to `LISTEN`
+ - **❗ Gotcha ❗**: The `LISTEN` thread can get backed up
+ - **🟢 Pattern 🟢**: Do your work elsewhere from the `LISTEN` thread
+ - If stock prices are changing faster than the user can see anyway, do you need to keep up?
+ - **🟢 Pattern 🟢**: `LISTEN`er doesn't need to care about every message
+:::
+
+# Ticker View
+
+## Ticker View
+
+ - Traders are constantly switching between stock tickers to view data related to a given ticker
+ - When a trader switches what ticker they're viewing, each UI receives a message from the service with the ticker to load data for
+
+## Ticker View Architecture
+
+:::{.r-stretch}
+![](tickerview.excalidraw.svg)
+:::
+
+## Ticker View Schema
+
+::: {.fragment}
+```{python}
+run_sql("""
+CREATE TABLE ticker_view
+(
+    id        SERIAL PRIMARY KEY,
+    username  TEXT NOT NULL,
+    ticker    TEXT NOT NULL
+)
+""", print_sql=True, print_output=False)
+```
+:::
+
+## Basic Ticker View Pub Sub
+
+We've seen all this before...
+```{python}
+run_sql("""
+INSERT INTO ticker_view (username, ticker)
+VALUES ('paul', 'AAPL')
+RETURNING id
+""", print_sql=True, print_output=False)
+```
+```{python}
+run_sql("""
+SELECT pg_notify('ticker_view', '1')
+""", print_sql=True, print_output=False)
+```
+
+```{.sql}
+LISTEN ticker_view;
+```
+```{python}
+run_sql("""
+SELECT ticker FROM ticker_view
+WHERE id = 1
+""", print_sql=True, print_output=True)
+```
+
+## Goal: High Availabilitiy
+
+::: {.incremental}
+ - What if the UI briefly loses connection to the service?
+ - What if the service briefly loses connection to the database?
+ - **❗ Gotcha ❗**: You miss messages when you aren't connected
+:::
+
+## Querying for what we missed
+
+::: {.incremental}
+ - How do we know what we missed?
+ - Let's assume the UI was keeping track of the ID of the last
+ message it received
+	- In this case, `0` to indicate it hasn't received any messages
+:::
+
+::: {.fragment}
+```{python}
+run_sql("""
+SELECT ticker FROM ticker_view
+WHERE id > 0
+AND username = 'paul'
+""", print_sql=True, print_output=True)
+```
+:::
+
+## Multiple missed messages, like Kafka {.smaller}
+
+```{python}
+run_sql("""
+INSERT INTO ticker_view (username, ticker)
+VALUES ('paul', 'NVDA')
+""", print_sql=False, print_output=False)
+```
+
+But what if we missed multiple messages?
+```{python}
+run_sql("""
+SELECT id, ticker FROM ticker_view
+WHERE id > 0
+AND username = 'paul'
+""", print_sql=True, print_output=True)
+```
+
+::: {.incremental}
+ - This is analogous to a concept in Kafka called **consumer groups**
+ - Consumer Groups help you pick up where you left off, by keeping track of the last message ID ("offset")
+ - With Kafka you have to consume every message, which we don't want to do in this case
+:::
+
+## Multiple missed messages, with Postgres {.smaller}
+
+For this use case, we only care about the last message of the ones that we missed
+```{python}
+run_sql("""
+SELECT id, ticker FROM ticker_view
+WHERE username = 'paul'
+AND id > 0
+ORDER BY id DESC LIMIT 1;
+""", print_sql=True, print_output=True)
+```
+
+::: {.fragment}
+ - This is more useful to us than Kafka Consumer Groups!
+ - Not having to read every message is an *advantage*
+ - It all depends on the use case 
+ - **🟢 Pattern 🟢**: `LISTEN`er doesn't need to care about every message
+:::
+
+# Patterns and Gotchas Summary
+
+## Patterns and Gotchas
+
+ - **❗ Gotcha ❗**: `NOTIFY` payloads have a **hard 8kb limit**
+ - **🟢 Pattern 🟢**: `NOTIFY` *instructions* about what to read, not the data itself
+ - **🟢 Pattern 🟢**: `LISTEN`er doesn't need to care about every message
+ - **🟢 Pattern 🟢**: On `LISTEN`, query for the whole state, let the database manage the state
+ - **❗ Gotcha ❗**: The `LISTEN` thread can get backed up
+ - **🟢 Pattern 🟢**: Do your work elsewhere from the `LISTEN` thread
+
+
+## Some notes on *scale*, Kafka, and Postgres
+
+ - Kafka is good for lots of messages and lots of subscribers
+ - Do you really need to send that many messages?
+ - Do you really need that many subscribers?
+ - You can get far on Postgres using the right patterns
+
+## Thanks For Listening!
+
+**Questions?**
+
+![](qrcode_pgwhalen.com.png)
+
+ - Presentation: pgwhalen.com/pg-pubsub-talk
+ - Source: github.com/pgwhalen/pg-pubsub-talk/
+
