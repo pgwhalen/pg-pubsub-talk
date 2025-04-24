@@ -1,5 +1,5 @@
 ---
-title: "Who Needs Kafka? Simple PubSub on Postgres Using LISTEN/NOTIFY"
+title: "Who Needs Kafka? PubSub Patterns Beyond Message Queues on Postgres Using LISTEN/NOTIFY"
 author: "Paul Whalen"
 output-dir: "presentation"
 output: asis
@@ -16,6 +16,12 @@ format:
 
 import psycopg2
 
+# -- run against fresh postgres as postgres user first
+# CREATE ROLE paul;
+# CREATE DATABASE paul;
+# ALTER ROLE paul WITH LOGIN;
+# GRANT CREATE ON DATABASE paul TO paul;
+
 conn = psycopg2.connect(
     dbname="paul",
     user="paul",
@@ -23,7 +29,7 @@ conn = psycopg2.connect(
     port=5432
 )
 cursor = conn.cursor()
-cursor.execute("DROP SCHEMA pubsub CASCADE")
+cursor.execute("DROP SCHEMA IF EXISTS pubsub CASCADE")
 cursor.execute("CREATE SCHEMA pubsub")
 conn.commit()
 
@@ -69,7 +75,7 @@ def fetch_and_print_md_table(cursor):
 ## whoami
  - Senior Staff Software Engineer @ PEAK6 Capital Management
 	- Proprietary options trading firm in Chicago
- - ~10 YOE as primarily-backend application engineer (Java, Go, Python)
+ - ~11 YOE as primarily-backend application engineer (Java, Go, Python)
 	- Data engineering experience as well, with lots of Kafka and SQL
  - Database nerd
 
@@ -197,7 +203,7 @@ CREATE TABLE a_topic (
 
 Subscriber listens
 ```{.sql .myframe}
-LISTEN a_topic;
+LISTEN a_topic
 ```
 
 Publisher writes message...
@@ -228,12 +234,64 @@ SELECT * FROM a_topic WHERE id = 1
 """, print_sql=True, print_output=True)
 ```
 
-
 ::: {.notes}
  - notice we're not sending the whole message: it's a bad idea, more on that later
 :::
 
-# LISTEN/NOTIFY in Production
+## A "queue" on Postgres
+
+Table to store messages
+```{python}
+run_sql("""
+CREATE TABLE a_queue (
+	id SERIAL PRIMARY KEY,
+	message TEXT,
+	processed BOOLEAN DEFAULT FALSE -- new column
+)
+""", print_sql=True, print_output=False)
+```
+
+Subscriber listens
+```{.sql .myframe}
+LISTEN a_queue
+```
+
+Publisher writes message...
+```{python}
+run_sql("""
+INSERT INTO a_queue (message)
+VALUES ('hi')
+RETURNING id
+""", print_sql=True, print_output=False)
+```
+... and notifies that it has been written (transactionally)
+```{python}
+run_sql("""
+SELECT pg_notify('a_queue', '1')
+""", print_sql=True, print_output=False)
+```
+
+## A "queue" on Postgres
+
+::: {.incremental}
+Subscriber receives notification...
+```{.log}
+'1'
+```
+... and processes message
+```{python}
+run_sql("""
+SELECT * FROM a_queue WHERE processed = false
+FOR UPDATE SKIP LOCKED LIMIT 1;
+-- ... process record in transaction
+UPDATE a_queue SET processed = true WHERE id = 1;
+""", print_sql=True, print_output=False)
+```
+
+ChatGPT wrote it!
+:::
+
+# LISTEN/NOTIFY Beyond Topics and Queues, In Production
 
 # Config Blob Service
 
@@ -455,7 +513,7 @@ WHERE username = 'paul'
 	- Partitions can be clumsly; you can only partition one way
 :::
 
-## Bonus: Handling deletes {.smaller}
+## Bonus: Handling (soft) deletes {.smaller}
 
 ::: {.fragment}
 Add a column representing items that were removed from the cart
@@ -581,6 +639,29 @@ GROUP BY ticker
  - If stock prices are changing faster than the user can see anyway, do you need to keep up?
  - **🟢 Pattern 🟢**: `LISTEN`er doesn't need to care about every message
 :::
+
+## Alternatively: Batch Writes
+
+```{python}
+run_sql("""
+INSERT INTO stock_price (ticker, timestamp, price)
+VALUES ('AAPL', '2025-01-01 8:30:00', 100.00),
+       ('AAPL', '2025-01-01 8:30:01', 100.01),
+       ('AAPL', '2025-01-01 8:30:02', 100.02)
+""", print_sql=True, print_output=False)
+```
+
+Only notify *once* for the whole batch
+```{python}
+run_sql("""
+SELECT pg_notify('stock_price', 'AAPL')
+""", print_sql=True, print_output=False)
+```
+
+::: {.incremental}
+- **🟢 Pattern 🟢**: `LISTEN`er doesn't need to care about every *row*
+- Disadvantage: increased latency while batch accumulates
+::: 
 
 # Ticker View
 
