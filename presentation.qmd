@@ -181,9 +181,9 @@ LISTEN a_channel;
 :::
 
 ## "Kafka" on Postgres
- - A table per topic
+ - A table per topic containing the messages
  - Publisher writes to table, `NOTIFY` ID
- - Susbcriber `LISTEN`S, reads messages from table
+ - Susbcriber `LISTEN`s, reads messages from table
 
 ::: {.notes}
  - this is the simplest possible implementation
@@ -474,7 +474,7 @@ SELECT pg_notify('shopping_cart', 'paul')
 ::: {.fragment}
 Listening
 ```{.sql}
-LISTEN a_channel;  -- 'paul'
+LISTEN shopping_cart;  -- 'paul'
 ```
 :::
 
